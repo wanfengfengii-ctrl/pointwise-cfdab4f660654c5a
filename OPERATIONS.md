@@ -38,4 +38,4 @@ released_bytes只计本次实际删除文件的大小，不能按逻辑引用次
 Gate已提供POINTWISE_PAUSE和POINTWISE_GATE；匹配事件第一次到达时写ready.json，等待同目录continue文件。流水线现有事件见源码。清理增加before_delete事件，detail含相对ROOT的path，在完成删除资格裁决后、实际删除前调用同一Gate；如果采用回收站，指向届时待删除文件的路径。
 releasecheck.py是安装包上线回归辅助，包含暂停交错、共享载荷、真实SIGKILL重开和清理中断；可补测，不得以打印成功代替业务核对。最终还需覆盖完成提交前后、同名载荷重新接纳与遗留临时文件边界，并保留可重跑入口和实际输出。
 在macOS中默认安装后，提交一个批次，由已加载的LaunchAgent自行完成，再用安装入口read核账；记录launchctl状态与结果，最后可bootout并移除本次测试标签。
-修改.pointwise-runtime.json的verify/demo，使其验证与展示经过安装入口的真实结果；交付简短恢复说明及上线回归记录，区分实际运行和仅生成配置的验证。本题不要求界面、调度器、历史备份、存储迁移或通用文件清理工具。
+修改.pointwise-runtime.json的verify/demo，使其验证与展示经过安装入口的真实结果；交付简短恢复说明及上线回归记录，区分实际运行和仅生成配置的验证。恢复步骤、终止边界与本次回归记录见RECOVERY.md。本题不要求界面、调度器、历史备份、存储迁移或通用文件清理工具。

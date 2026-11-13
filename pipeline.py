@@ -84,10 +84,35 @@ def connect(path):
     return db
 
 
+class _NullHold:
+    def add(self, oid):
+        return self
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+
+_NULL_HOLD = _NullHold()
+
+
+class _NullProtector:
+    """Default protector when persistence has no shared-reference coordinator."""
+
+    def hold(self, oids=()):
+        return _NULL_HOLD
+
+
 class Engine:
-    def __init__(self, db, blobs, hook=None):
+    def __init__(self, db, blobs, hook=None, protector=None):
         self.db, self.blobs = db, blobs
         self.hook = hook or (lambda event, detail: None)
+        self.protector = protector or _NullProtector()
         db.execute("""CREATE TABLE IF NOT EXISTS jobs(
             id TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
             checkpoint TEXT, result TEXT, receipt TEXT)""")
@@ -95,7 +120,6 @@ class Engine:
 
     def _put(self, value):
         oid = self.blobs.put(value)
-        self.hook("object_ready", {"oid": oid})
         return oid
 
     def accept(self, batch):
@@ -107,18 +131,26 @@ class Engine:
             if old[0] != request_hash:
                 raise ValueError("BATCH_CONFLICT")
             return {"batch": batch["batch"], "sha256": request_hash}
-        sources = [self._put(segment) for segment in batch["segments"]]
-        cp = {"stage": "normalize", "sources": sources, "index": 0, "chunks": []}
-        self.hook("before_accept", {"batch": batch["batch"], "checkpoint": cp})
-        with self.db:
-            self.db.execute("BEGIN IMMEDIATE")
-            old = self.db.execute("SELECT request_hash FROM jobs WHERE id=?",
-                                  (batch["batch"],)).fetchone()
-            if old and old[0] != request_hash:
-                raise ValueError("BATCH_CONFLICT")
-            if not old:
-                self.db.execute("INSERT INTO jobs VALUES(?,?,?,NULL,NULL)",
-                                (batch["batch"], request_hash, encoded(cp).decode()))
+        # Every payload published for this batch stays referenced by the live
+        # holder until the row (and its initial checkpoint) are committed.
+        with self.protector.hold() as held:
+            sources = []
+            for segment in batch["segments"]:
+                oid = self._put(segment)
+                sources.append(oid)
+                held.add(oid)
+                self.hook("object_ready", {"oid": oid})
+            cp = {"stage": "normalize", "sources": sources, "index": 0, "chunks": []}
+            self.hook("before_accept", {"batch": batch["batch"], "checkpoint": cp})
+            with self.db:
+                self.db.execute("BEGIN IMMEDIATE")
+                old = self.db.execute("SELECT request_hash FROM jobs WHERE id=?",
+                                      (batch["batch"],)).fetchone()
+                if old and old[0] != request_hash:
+                    raise ValueError("BATCH_CONFLICT")
+                if not old:
+                    self.db.execute("INSERT INTO jobs VALUES(?,?,?,NULL,NULL)",
+                                    (batch["batch"], request_hash, encoded(cp).decode()))
         self.hook("after_accept", {"batch": batch["batch"]})
         return {"batch": batch["batch"], "sha256": request_hash}
 
@@ -148,34 +180,44 @@ class Engine:
         key, request_hash, cp_text = row
         cp = json.loads(cp_text)
         self.hook("checkpoint_loaded", {"batch": key, "checkpoint": cp})
-        if cp["stage"] == "normalize":
-            index = cp["index"]
-            if index < len(cp["sources"]):
-                value = self.blobs.get(cp["sources"][index])
-                cp["chunks"].append(self._put(normalize(value)))
-                cp["index"] += 1
-                # Clear consumed source IDs so a checkpoint exposes only real dependencies.
-                cp["sources"][index] = None
+        # The holder covers the whole checkpoint transition: every payload read
+        # or published here stays protected until the next checkpoint (or the
+        # completion commit) is durable.
+        with self.protector.hold(dependencies(cp)) as held:
+            if cp["stage"] == "normalize":
+                index = cp["index"]
+                if index < len(cp["sources"]):
+                    value = self.blobs.get(cp["sources"][index])
+                    oid = self._put(normalize(value))
+                    cp["chunks"].append(oid)
+                    held.add(oid)
+                    self.hook("object_ready", {"oid": oid})
+                    cp["index"] += 1
+                    # Clear consumed source IDs so a checkpoint exposes only real dependencies.
+                    cp["sources"][index] = None
+                else:
+                    cp = {"stage": "merge", "todo": cp["chunks"], "acc": None}
+                self._save(key, cp)
+            elif cp["todo"]:
+                left = self.blobs.get(cp["acc"]) if cp["acc"] else []
+                right = self.blobs.get(cp["todo"][0])
+                oid = self._put(merge(left, right))
+                cp["acc"] = oid
+                held.add(oid)
+                self.hook("object_ready", {"oid": oid})
+                cp["todo"] = cp["todo"][1:]
+                self._save(key, cp)
             else:
-                cp = {"stage": "merge", "todo": cp["chunks"], "acc": None}
-            self._save(key, cp)
-        elif cp["todo"]:
-            left = self.blobs.get(cp["acc"]) if cp["acc"] else []
-            right = self.blobs.get(cp["todo"][0])
-            cp["acc"] = self._put(merge(left, right))
-            cp["todo"] = cp["todo"][1:]
-            self._save(key, cp)
-        else:
-            rows = self.blobs.get(cp["acc"]) if cp["acc"] else []
-            result = summarize(rows)
-            receipt = {"batch": key, "sha256": request_hash,
-                       "groups": len(result), "samples": sum(r["count"] for r in result)}
-            self.hook("before_finish", {"batch": key})
-            with self.db:
-                self.db.execute(
-                    "UPDATE jobs SET result=?,receipt=?,checkpoint=NULL WHERE id=?",
-                    (encoded(result).decode(), encoded(receipt).decode(), key))
-            self.hook("after_finish", {"batch": key})
+                rows = self.blobs.get(cp["acc"]) if cp["acc"] else []
+                result = summarize(rows)
+                receipt = {"batch": key, "sha256": request_hash,
+                           "groups": len(result), "samples": sum(r["count"] for r in result)}
+                self.hook("before_finish", {"batch": key})
+                with self.db:
+                    self.db.execute(
+                        "UPDATE jobs SET result=?,receipt=?,checkpoint=NULL WHERE id=?",
+                        (encoded(result).decode(), encoded(receipt).decode(), key))
+                self.hook("after_finish", {"batch": key})
         return True
 
     def drain(self):
